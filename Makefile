@@ -4,6 +4,16 @@ DKMS_TARBALL    ?= dkms.tar.gz
 TAR             ?= tar
 obj-m           += lotspeed.o
 
+KERNEL_COMPILE_H := $(KERNEL_DIR)/include/generated/compile.h
+KERNEL_COMPILER   := $(shell grep -m1 '^#define LINUX_COMPILER ' $(KERNEL_COMPILE_H) 2>/dev/null)
+
+AUTO_BUILD_CC := gcc
+AUTO_BUILD_LLVM :=
+ifneq ($(findstring clang,$(KERNEL_COMPILER)),)
+AUTO_BUILD_CC := clang
+AUTO_BUILD_LLVM := 1
+endif
+
 ccflags-y := -std=gnu99 \
 	-Wno-error=int-in-bool-context \
 	-Wno-error=unused-variable
@@ -12,7 +22,7 @@ ccflags-y := -std=gnu99 \
 .PHONY: .always-make
 
 all:
-	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) modules
+	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) modules CC=$(AUTO_BUILD_CC) $(if $(AUTO_BUILD_LLVM),LLVM=$(AUTO_BUILD_LLVM))
 
 clean: clean-dkms.conf clean-dkms-tarball
 	$(MAKE) -C $(KERNEL_DIR) M=$(PWD) clean

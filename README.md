@@ -1,7 +1,7 @@
 ### lotspeed zeta-tcp
 
 <div align=center>
-    <img src="https://github.com/uk0/lotspeed/blob/zeta-tcp/logo.png" width="400" height="400" />
+    <img src="./logo.png" width="400" height="400" />
 </div>
 
 
@@ -24,9 +24,9 @@
 
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/uk0/lotspeed/zeta-tcp/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/Zephyr177/lotspeed/zeta-tcp/install.sh | sudo bash
 #   or
-wget -qO- https://raw.githubusercontent.com/uk0/lotspeed/zeta-tcp/install.sh | sudo bash
+wget -qO- https://raw.githubusercontent.com/Zephyr177/lotspeed/zeta-tcp/install.sh | sudo bash
 ```
 
 
@@ -36,7 +36,7 @@ wget -qO- https://raw.githubusercontent.com/uk0/lotspeed/zeta-tcp/install.sh | s
 
 # 下载代码/编译
 
-git clone https://github.com/uk0/lotspeed.git 
+git clone https://github.com/Zephyr177/lotspeed.git
 
 cd lotspeed && make
 
@@ -81,7 +81,7 @@ root@racknerd-6bf1e7b:~# lotspeed
 
 
 <div align=center>
-    <img src="https://github.com/uk0/lotspeed/blob/zeta-tcp/zeta-tcp.png" width="1024" height="768" />
+    <img src="./zeta-tcp.png" width="1024" height="768" />
 </div>
 
 
@@ -140,5 +140,4 @@ PAC (Proactive ACK Control) for TCP Incast Congestion
 -----------------------------------
 
 
-[![Star History Chart](https://api.star-history.com/svg?repos=uk0/lotspeed&type=Date)](https://star-history.com/#uk0/lotspeed&Date)
-
+[![Star History Chart](https://api.star-history.com/svg?repos=Zephyr177/lotspeed&type=Date)](https://star-history.com/#Zephyr177/lotspeed&Date)

@@ -2,22 +2,24 @@
 #
 # LotSpeed v5.6 - Zeta-TCP Auto-Scaling Edition (UI Enhanced)
 # Author: uk0 @ 2025-11-23
-# GitHub: https://github.com/uk0/lotspeed
+# GitHub: https://github.com/Zephyr177/lotspeed
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/uk0/lotspeed/zeta-tcp/install.sh | sudo bash
+#   curl -fsSL https://raw.githubusercontent.com/Zephyr177/lotspeed/zeta-tcp/install.sh | sudo bash
 #
 
 set -e
 
 # ================= 配置区域 =================
-GITHUB_REPO="uk0/lotspeed"
+GITHUB_REPO="Zephyr177/lotspeed"
 GITHUB_BRANCH="zeta-tcp"
 INSTALL_DIR="/opt/lotspeed"
 MODULE_NAME="lotspeed"
 VERSION="5.6"
 CURRENT_TIME=$(date '+%Y-%m-%d %H:%M:%S')
 CURRENT_USER=$(whoami)
+KERNEL_BUILD_DIR="/lib/modules/$(uname -r)/build"
+KERNEL_TOOLCHAIN="gcc"
 
 # ================= 颜色定义 =================
 RED='\033[0;31m'
@@ -120,6 +122,15 @@ log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 log_success() { echo -e "${GREEN}[✓]${NC} $1"; }
 
+detect_kernel_toolchain() {
+    local compile_h="$KERNEL_BUILD_DIR/include/generated/compile.h"
+    KERNEL_TOOLCHAIN="gcc"
+
+    if [[ -r "$compile_h" ]] && grep -qi 'clang' "$compile_h"; then
+        KERNEL_TOOLCHAIN="clang"
+    fi
+}
+
 print_banner() {
     echo -e "${CYAN}"
     cat << "EOF"
@@ -184,22 +195,30 @@ check_system() {
         log_warn "Architecture $ARCH may not be fully tested"
     fi
 
+    detect_kernel_toolchain
+
     log_success "System: $OS $OS_VERSION (kernel $(uname -r), $ARCH)"
+    log_info "Kernel toolchain: $KERNEL_TOOLCHAIN"
 }
 
 install_dependencies() {
     log_info "Installing dependencies..."
 
+    local compiler_pkgs="gcc"
+    if [[ "$KERNEL_TOOLCHAIN" == "clang" ]]; then
+        compiler_pkgs="gcc clang llvm lld"
+    fi
+
     if [[ "$OS" == "centos" ]]; then
-        yum install -y gcc make kernel-devel-$(uname -r) kernel-headers-$(uname -r) wget curl bc 2>/dev/null || {
+        yum install -y $compiler_pkgs make kernel-devel-$(uname -r) kernel-headers-$(uname -r) wget curl bc 2>/dev/null || {
             log_warn "Some packages may be missing, trying alternative..."
-            yum install -y gcc make kernel-devel kernel-headers wget curl bc
+            yum install -y $compiler_pkgs make kernel-devel kernel-headers wget curl bc
         }
     elif [[ "$OS" == "debian" ]] || [[ "$OS" == "ubuntu" ]]; then
         apt-get update >/dev/null 2>&1
-        apt-get install -y gcc make linux-headers-$(uname -r) wget curl bc 2>/dev/null || {
+        apt-get install -y $compiler_pkgs make linux-headers-$(uname -r) wget curl bc 2>/dev/null || {
             log_warn "Some packages may be missing, trying alternative..."
-            apt-get install -y gcc make linux-headers-generic wget curl bc
+            apt-get install -y $compiler_pkgs make linux-headers-generic wget curl bc
         }
     fi
 
@@ -219,31 +238,11 @@ download_source() {
         exit 1
     }
 
-    # 创建 Makefile
-    cat > Makefile << 'EOF'
-obj-m += lotspeed.o
-
-KERNELDIR ?= /lib/modules/$(shell uname -r)/build
-PWD := $(shell pwd)
-
-all:
-	$(MAKE) -C $(KERNELDIR) M=$(PWD) modules
-
-clean:
-	$(MAKE) -C $(KERNELDIR) M=$(PWD) clean
-
-install: all
-	insmod lotspeed.ko
-	@echo "lotspeed" >> /etc/modules-load.d/lotspeed.conf 2>/dev/null || true
-	@cp lotspeed.ko /lib/modules/$(shell uname -r)/kernel/net/ipv4/ 2>/dev/null || true
-	@depmod -a
-
-uninstall:
-	-rmmod lotspeed 2>/dev/null
-	@rm -f /etc/modules-load.d/lotspeed.conf
-	@rm -f /lib/modules/$(shell uname -r)/kernel/net/ipv4/lotspeed.ko
-	@depmod -a
-EOF
+    # 下载仓库 Makefile，保证手动编译和安装脚本使用同一套构建逻辑
+    curl -fsSL "https://raw.githubusercontent.com/$GITHUB_REPO/$GITHUB_BRANCH/Makefile" -o Makefile || {
+        log_error "Failed to download Makefile"
+        exit 1
+    }
 
     log_success "Source code downloaded"
 }
@@ -254,9 +253,14 @@ compile_module() {
     cd $INSTALL_DIR
     make clean >/dev/null 2>&1
 
-    if ! make >/dev/null 2>&1; then
+    local make_args=()
+    if [[ "$KERNEL_TOOLCHAIN" == "clang" ]]; then
+        make_args+=(CC=clang LLVM=1)
+    fi
+
+    if ! make "${make_args[@]}" >/dev/null 2>&1; then
         log_error "Compilation failed. Checking error..."
-        make 2>&1 | tail -20
+        make "${make_args[@]}" 2>&1 | tail -20
         exit 1
     fi
 
