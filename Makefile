@@ -5,7 +5,21 @@ TAR             ?= tar
 obj-m           += lotspeed.o
 
 KERNEL_COMPILE_H := $(KERNEL_DIR)/include/generated/compile.h
-KERNEL_COMPILER   := $(shell grep -m1 '^#define LINUX_COMPILER ' $(KERNEL_COMPILE_H) 2>/dev/null)
+KERNEL_CONFIG    := $(KERNEL_DIR)/.config
+KERNEL_COMPILER  := $(shell \
+	if grep -qs '^CONFIG_CC_IS_CLANG=y' $(KERNEL_CONFIG) 2>/dev/null; then \
+		echo clang; \
+	elif grep -qs '^CONFIG_CC_IS_GCC=y' $(KERNEL_CONFIG) 2>/dev/null; then \
+		echo gcc; \
+	elif grep -qi 'clang' $(KERNEL_COMPILE_H) 2>/dev/null; then \
+		echo clang; \
+	elif grep -qi 'gcc' $(KERNEL_COMPILE_H) 2>/dev/null; then \
+		echo gcc; \
+	elif grep -qi 'clang' /proc/version 2>/dev/null; then \
+		echo clang; \
+	elif grep -qi 'gcc' /proc/version 2>/dev/null; then \
+		echo gcc; \
+	fi)
 
 AUTO_BUILD_CC := gcc
 AUTO_BUILD_LLVM :=

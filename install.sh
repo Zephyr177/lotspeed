@@ -123,10 +123,16 @@ log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 log_success() { echo -e "${GREEN}[✓]${NC} $1"; }
 
 detect_kernel_toolchain() {
+    local config_file="$KERNEL_BUILD_DIR/.config"
     local compile_h="$KERNEL_BUILD_DIR/include/generated/compile.h"
+    local proc_version="/proc/version"
     KERNEL_TOOLCHAIN="gcc"
 
-    if [[ -r "$compile_h" ]] && grep -qi 'clang' "$compile_h"; then
+    if [[ -r "$config_file" ]] && grep -qs '^CONFIG_CC_IS_CLANG=y' "$config_file"; then
+        KERNEL_TOOLCHAIN="clang"
+    elif [[ -r "$compile_h" ]] && grep -qi 'clang' "$compile_h"; then
+        KERNEL_TOOLCHAIN="clang"
+    elif [[ -r "$proc_version" ]] && grep -qi 'clang' "$proc_version"; then
         KERNEL_TOOLCHAIN="clang"
     fi
 }
@@ -258,10 +264,21 @@ compile_module() {
         make_args+=(CC=clang LLVM=1)
     fi
 
-    if ! make "${make_args[@]}" >/dev/null 2>&1; then
-        log_error "Compilation failed. Checking error..."
-        make "${make_args[@]}" 2>&1 | tail -20
-        exit 1
+    local build_output
+    if ! build_output=$(make "${make_args[@]}" 2>&1); then
+        if [[ "$KERNEL_TOOLCHAIN" != "clang" ]] && command -v clang >/dev/null 2>&1 && echo "$build_output" | grep -Eq 'unrecognized command-line option .*(-mstack-alignment=8|-mretpoline-external-thunk|-fsplit-lto-unit)'; then
+            log_warn "GCC failed on a clang-built kernel; retrying with clang..."
+            make_args=(CC=clang LLVM=1)
+            if ! build_output=$(make "${make_args[@]}" 2>&1); then
+                log_error "Compilation failed. Checking error..."
+                printf '%s\n' "$build_output" | tail -20
+                exit 1
+            fi
+        else
+            log_error "Compilation failed. Checking error..."
+            printf '%s\n' "$build_output" | tail -20
+            exit 1
+        fi
     fi
 
     if [[ ! -f lotspeed.ko ]]; then
