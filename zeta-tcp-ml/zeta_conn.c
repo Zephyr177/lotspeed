@@ -61,6 +61,15 @@ static void zeta_conn_free_rcu(struct rcu_head *head)
         kfree(conn);
 }
 
+void zeta_conn_put(struct zeta_conn *conn)
+{
+    if (!conn)
+        return;
+
+    if (atomic_dec_and_test(&conn->refcnt))
+        call_rcu(&conn->rcu, zeta_conn_free_rcu);
+}
+
 /* ========== 查找连接 ========== */
 struct zeta_conn *zeta_conn_find(__be32 saddr, __be32 daddr,
                                   __be16 sport, __be16 dport)
@@ -77,6 +86,10 @@ struct zeta_conn *zeta_conn_find(__be32 saddr, __be32 daddr,
     hash_for_each_possible_rcu(g_zeta->conn_table, conn, hnode, hash) {
         if (conn->saddr == saddr && conn->daddr == daddr &&
             conn->sport == sport && conn->dport == dport) {
+            if (READ_ONCE(conn->closing) || !atomic_inc_not_zero(&conn->refcnt)) {
+                rcu_read_unlock();
+                return NULL;
+            }
             rcu_read_unlock();
             return conn;
         }
@@ -119,11 +132,15 @@ struct zeta_conn *zeta_conn_create(__be32 saddr, __be32 daddr,
     conn->sport = sport;
     conn->dport = dport;
     conn->hash_key = zeta_conn_hash(saddr, daddr, sport, dport);
+    atomic_set(&conn->refcnt, 2); /* table ref + caller ref */
+    conn->closing = false;
 
     spin_lock_init(&conn->lock);
 
     conn->state = ZETA_STATE_NORMAL;
+    conn->pending_state = ZETA_STATE_NORMAL;
     conn->loss_pattern = LOSS_NONE;
+    conn->state_hold_count = 0;
 
     conn->create_time_us = now_us;
     conn->last_active_us = now_us;
@@ -132,6 +149,7 @@ struct zeta_conn *zeta_conn_create(__be32 saddr, __be32 daddr,
 
     conn->ack_rwnd_scale = 100;
     conn->ack_dup_thresh = 3;
+    conn->last_ack_observed_us = now_us;
 
     zeta_ack_split_init(conn);
 
@@ -159,13 +177,15 @@ void zeta_conn_destroy(struct zeta_conn *conn)
         return;
 
     spin_lock_bh(&g_zeta->conn_lock);
-    hash_del_rcu(&conn->hnode);
-    atomic_dec(&g_zeta->conn_count);
+    if (!conn->closing) {
+        WRITE_ONCE(conn->closing, true);
+        hash_del_rcu(&conn->hnode);
+        atomic_dec(&g_zeta->conn_count);
+        atomic64_dec(&g_zeta->stats.conns_active);
+        zeta_conn_put(conn); /* table ref */
+    }
     spin_unlock_bh(&g_zeta->conn_lock);
 
-    atomic64_dec(&g_zeta->stats.conns_active);
-
-    call_rcu(&conn->rcu, zeta_conn_free_rcu);
 }
 
 /* ========== 垃圾回收 ========== */
@@ -185,11 +205,14 @@ void zeta_conn_gc(struct timer_list *t)
 
     hash_for_each_safe(g_zeta->conn_table, bkt, tmp, conn, hnode) {
         if (now_ms - conn->last_active > timeout_ms) {
-            hash_del_rcu(&conn->hnode);
-            atomic_dec(&g_zeta->conn_count);
-            atomic64_dec(&g_zeta->stats.conns_active);
-            call_rcu(&conn->rcu, zeta_conn_free_rcu);
-            cleaned++;
+            if (!conn->closing) {
+                WRITE_ONCE(conn->closing, true);
+                hash_del_rcu(&conn->hnode);
+                atomic_dec(&g_zeta->conn_count);
+                atomic64_dec(&g_zeta->stats.conns_active);
+                zeta_conn_put(conn); /* table ref */
+                cleaned++;
+            }
         }
     }
 
@@ -232,14 +255,14 @@ void zeta_conn_cleanup(void)
 
     spin_lock_bh(&g_zeta->conn_lock);
     hash_for_each_safe(g_zeta->conn_table, bkt, tmp, conn, hnode) {
-        hash_del(&conn->hnode);
-        if (zeta_conn_cachep)
-            kmem_cache_free(zeta_conn_cachep, conn);
-        else
-            kfree(conn);
+        hash_del_rcu(&conn->hnode);
+        WRITE_ONCE(conn->closing, true);
+        zeta_conn_put(conn); /* table ref */
     }
     atomic_set(&g_zeta->conn_count, 0);
     spin_unlock_bh(&g_zeta->conn_lock);
+
+    synchronize_rcu();
 
     /* 销毁 SLAB 缓存 */
     zeta_conn_cache_destroy();

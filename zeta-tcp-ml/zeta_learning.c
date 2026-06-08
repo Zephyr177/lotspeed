@@ -9,11 +9,18 @@
 #include <linux/math64.h>
 #include "zeta_core.h"
 
+static inline u32 zeta_ewma_u32(u32 old, u32 sample, u32 weight)
+{
+    if (old == 0)
+        return sample;
+    return (old * (weight - 1) + sample) / weight;
+}
+
 /* 整数平方根 */
 static u32 zeta_isqrt(u32 n)
 {
     u32 x, x1;
-    
+
     if (n == 0)
         return 0;
     
@@ -139,13 +146,14 @@ static zeta_loss_pattern_t zeta_classify_loss_pattern(struct zeta_conn *conn)
     u32 time_since_last_loss;
     u32 loss_rate_permille;
     
-    if (f->loss_total == 0)
+    if (f->loss_total == 0 && f->loss_probability < ZETA_LOSS_PROB_MED)
         return LOSS_NONE;
     
     time_since_last_loss = (u32)(now_ms - conn->last_loss_time);
     
     /* 阵发丢包 */
-    if (f->loss_burst_count >= ZETA_LOSS_BURST_THRESH) {
+    if (f->loss_burst_count >= ZETA_LOSS_BURST_THRESH ||
+        f->burst_loss_prob >= ZETA_LOSS_PROB_HIGH) {
         return LOSS_BURST;
     }
     
@@ -153,12 +161,14 @@ static zeta_loss_pattern_t zeta_classify_loss_pattern(struct zeta_conn *conn)
     if (conn->pkts_sent > 20) {
         loss_rate_permille = zeta_div32(f->loss_total * 1000, conn->pkts_sent);
         
-        if (loss_rate_permille <= 20 && time_since_last_loss > 500) {
+        if ((loss_rate_permille <= 20 && time_since_last_loss > 500) ||
+            f->random_loss_prob > f->burst_loss_prob) {
             return LOSS_RANDOM;
         }
     }
     
-    if (f->rtt_trend > 0 && f->loss_recent > 0) {
+    if ((f->rtt_trend > 0 && f->loss_recent > 0) ||
+        f->tail_loss_prob >= ZETA_LOSS_PROB_MED) {
         return LOSS_TAIL;
     }
     
@@ -175,7 +185,7 @@ zeta_cong_state_t zeta_learn_classify(struct zeta_conn *conn)
     u32 std_dev;
     zeta_cong_state_t new_state;
     zeta_cong_state_t old_state = conn->state;
-    static u32 state_hold_count = 0;  /* 状态保持计数 (防抖) */
+    u32 path_score;
     
     atomic64_inc(&g_zeta->stats.learning_decisions);
     
@@ -203,8 +213,18 @@ zeta_cong_state_t zeta_learn_classify(struct zeta_conn *conn)
         rtt_jitter_pct = 0;
     }
     
+    /* 跨流协同：同一路径已有拥塞迹象时，对新连接做轻量预警。 */
+    path_score = zeta_learn_get_path_score();
+    if (g_zeta && g_zeta->cross_flow_enabled &&
+        path_score >= ZETA_PATH_SCORE_HIGH &&
+        f->congestion_score + 20 < path_score) {
+        u32 lift = min_t(u32, (path_score - f->congestion_score) / 4, 12U);
+        f->congestion_score = min_t(u32, f->congestion_score + lift, 100U);
+        atomic64_inc(&g_zeta->stats.cross_flow_adjustments);
+    }
+
     /* ========== 拥塞判断 ========== */
-    
+
     /* 阵发丢包 -> 严重拥塞 */
     if (loss_pattern == LOSS_BURST) {
         f->congestion_score = min_t(u32, f->congestion_score + 40, 100);
@@ -253,13 +273,20 @@ zeta_cong_state_t zeta_learn_classify(struct zeta_conn *conn)
     
     /* ========== 防抖动: 状态至少保持 5 个决策周期 ========== */
     if (new_state != old_state) {
-        state_hold_count++;
-        if (state_hold_count < 5) {
+        if (conn->pending_state != new_state) {
+            conn->pending_state = new_state;
+            conn->state_hold_count = 1;
+        } else {
+            conn->state_hold_count++;
+        }
+
+        if (conn->state_hold_count < ZETA_STATE_HOLD_TICKS) {
             /* 还没达到切换阈值，保持原状态 */
             new_state = old_state;
         } else {
             /* 达到阈值，允许切换 */
-            state_hold_count = 0;
+            conn->state_hold_count = 0;
+            conn->pending_state = new_state;
             
             /* 状态变化时记录日志 */
             if (g_zeta && g_zeta->verbose) {
@@ -276,9 +303,12 @@ zeta_cong_state_t zeta_learn_classify(struct zeta_conn *conn)
             }
         }
     } else {
-        state_hold_count = 0;
+        conn->state_hold_count = 0;
+        conn->pending_state = old_state;
     }
     
+    zeta_learn_path_update(conn);
+
     return new_state;
 }
 
@@ -289,6 +319,114 @@ void zeta_learn_rtt_sample(struct zeta_conn *conn, u32 rtt_us)
         return;
     
     zeta_update_rtt_features(conn, rtt_us);
+}
+
+/* ========== ACK 事件：概率性丢包估计 ========== */
+void zeta_learn_ack_event(struct zeta_conn *conn, u32 ack_seq,
+                          bool advanced, bool duplicate)
+{
+    struct zeta_features *f;
+    u64 now_us;
+
+    if (!conn)
+        return;
+
+    (void)ack_seq;
+
+    f = &conn->features;
+    now_us = zeta_now_us();
+
+    if (conn->last_ack_observed_us > 0 && now_us > conn->last_ack_observed_us) {
+        u32 spacing = (u32)(now_us - conn->last_ack_observed_us);
+        if (spacing > 0 && spacing < 10000000)
+            conn->ack_spacing_us = zeta_ewma_u32(conn->ack_spacing_us, spacing, 8);
+    }
+    conn->last_ack_observed_us = now_us;
+
+    if (advanced) {
+        conn->dupack_run = 0;
+        f->loss_probability = (f->loss_probability * 7) / 8;
+        f->burst_loss_prob = (f->burst_loss_prob * 3) / 4;
+        f->tail_loss_prob = (f->tail_loss_prob * 7) / 8;
+        if (f->random_loss_prob > 20)
+            f->random_loss_prob -= 20;
+        else
+            f->random_loss_prob = 0;
+        return;
+    }
+
+    if (!duplicate)
+        return;
+
+    conn->dupack_run++;
+
+    f->loss_probability = min_t(u32,
+        f->loss_probability + 120 + conn->dupack_run * 45,
+        (u32)ZETA_PROB_SCALE);
+
+    if (conn->dupack_run >= ZETA_LOSS_BURST_THRESH) {
+        f->burst_loss_prob = min_t(u32,
+            f->burst_loss_prob + 180 + conn->dupack_run * 35,
+            (u32)ZETA_PROB_SCALE);
+    } else {
+        f->random_loss_prob = min_t(u32,
+            f->random_loss_prob + 90,
+            (u32)ZETA_PROB_SCALE);
+    }
+
+    if (f->rtt_trend > 0) {
+        f->tail_loss_prob = min_t(u32,
+            f->tail_loss_prob + 120,
+            (u32)ZETA_PROB_SCALE);
+    }
+
+    if (g_zeta)
+        atomic64_inc(&g_zeta->stats.loss_probability_events);
+}
+
+/* ========== 跨流路径指标 ========== */
+void zeta_learn_path_update(struct zeta_conn *conn)
+{
+    struct zeta_features *f;
+    unsigned long flags;
+
+    if (!g_zeta || !conn || !g_zeta->cross_flow_enabled)
+        return;
+
+    f = &conn->features;
+
+    spin_lock_irqsave(&g_zeta->path_lock, flags);
+
+    if (f->rtt_min > 0 &&
+        (g_zeta->path_rtt_min == 0 || f->rtt_min < g_zeta->path_rtt_min)) {
+        g_zeta->path_rtt_min = f->rtt_min;
+    }
+
+    if (f->rtt_avg > 0)
+        g_zeta->path_rtt_avg = zeta_ewma_u32(g_zeta->path_rtt_avg, f->rtt_avg, 8);
+
+    g_zeta->path_congestion_score = zeta_ewma_u32(
+        g_zeta->path_congestion_score, f->congestion_score, 8);
+    g_zeta->path_loss_probability = zeta_ewma_u32(
+        g_zeta->path_loss_probability, f->loss_probability, 8);
+
+    spin_unlock_irqrestore(&g_zeta->path_lock, flags);
+}
+
+u32 zeta_learn_get_path_score(void)
+{
+    u32 score;
+    unsigned long flags;
+
+    if (!g_zeta || !g_zeta->cross_flow_enabled)
+        return 0;
+
+    spin_lock_irqsave(&g_zeta->path_lock, flags);
+    score = max_t(u32, g_zeta->path_congestion_score,
+                  g_zeta->path_loss_probability / 10);
+    spin_unlock_irqrestore(&g_zeta->path_lock, flags);
+
+    return min_t(u32, score, 100U);
 }
 
 /* ========== 主更新函数 ========== */
@@ -329,6 +467,7 @@ u32 zeta_learn_get_cwnd(struct zeta_conn *conn)
     struct zeta_features *f = &conn->features;
     u32 bdp_pkts;
     u32 target_cwnd;
+    u32 path_score;
     
     if (f->bw_estimate > 0 && f->rtt_min > 0) {
         u64 bdp_bytes = div64_u64(f->bw_estimate * (u64)f->rtt_min, USEC_PER_SEC);
@@ -356,7 +495,11 @@ u32 zeta_learn_get_cwnd(struct zeta_conn *conn)
         default:
             target_cwnd = bdp_pkts;
     }
-    
+
+    path_score = zeta_learn_get_path_score();
+    if (path_score >= ZETA_PATH_SCORE_HIGH)
+        target_cwnd = min_t(u32, target_cwnd, (bdp_pkts * 8) / 10);
+
     return clamp_t(u32, target_cwnd, ZETA_CWND_MIN, ZETA_CWND_MAX);
 }
 

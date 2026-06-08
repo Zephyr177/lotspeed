@@ -8,6 +8,7 @@
 #include <linux/netfilter_ipv4.h>
 #include <net/ip.h>
 #include <net/tcp.h>
+#include <net/checksum.h>
 #include <linux/skbuff.h>
 #include <linux/percpu.h>
 #include "zeta_core.h"
@@ -134,6 +135,8 @@ static unsigned int zeta_hook_out(unsigned int hooknum, struct sk_buff *skb,
 
     /* ACK 处理 */
     if (th->ack) {
+        zeta_ack_handle_ecn(conn, th, iph);
+
         /* 判断是否需要修改 */
         switch (conn->state) {
             case ZETA_STATE_BURST_LOSS:
@@ -141,14 +144,17 @@ static unsigned int zeta_hook_out(unsigned int hooknum, struct sk_buff *skb,
                 should_modify = true;
                 break;
             case ZETA_STATE_RANDOM_LOSS:
-                should_modify = (conn->features.loss_total > 2);
+                should_modify = (conn->features.loss_total > 2 ||
+                                 conn->features.loss_probability >= ZETA_LOSS_PROB_MED);
                 break;
             case ZETA_STATE_STABLE_DELAY:
-                should_modify = (conn->features.congestion_score > 40);
+                should_modify = (conn->features.congestion_score > 40 ||
+                                 zeta_learn_get_path_score() >= ZETA_PATH_SCORE_HIGH);
                 break;
             case ZETA_STATE_NORMAL:
                 should_modify = (conn->features.congestion_score > 40 ||
-                                conn->features.loss_total > 3);
+                                 conn->features.loss_total > 3 ||
+                                 conn->features.loss_probability >= ZETA_LOSS_PROB_HIGH);
                 break;
             default:
                 should_modify = false;
@@ -168,6 +174,7 @@ static unsigned int zeta_hook_out(unsigned int hooknum, struct sk_buff *skb,
             if (skb_cloned(skb)) {
                 if (pskb_expand_head(skb, 0, 0, GFP_ATOMIC)) {
                     spin_unlock_bh(&conn->lock);
+                    zeta_conn_put(conn);
                     return NF_ACCEPT;
                 }
 
@@ -179,10 +186,8 @@ static unsigned int zeta_hook_out(unsigned int hooknum, struct sk_buff *skb,
             if (g_zeta->ack_split_enabled) {
                 ret = zeta_ack_split_process(conn, skb, th, payload_len);
                 if (ret == 1) {
-                    /* ACK 被延迟 */
+                    /* 保守模式：不在无定时器兜底时丢 ACK，只记录合并建议。 */
                     pstats->acks_delayed++;
-                    spin_unlock_bh(&conn->lock);
-                    return NF_ACCEPT;
                 }
             }
 
@@ -200,13 +205,18 @@ static unsigned int zeta_hook_out(unsigned int hooknum, struct sk_buff *skb,
                 }
             } else if (ret == -1) {
                 spin_unlock_bh(&conn->lock);
+                zeta_conn_put(conn);
                 pstats->acks_suppressed++;
                 return NF_DROP;
             }
         }
     }
 
+    if (th->fin || th->rst)
+        zeta_conn_destroy(conn);
+
     spin_unlock_bh(&conn->lock);
+    zeta_conn_put(conn);
 
     return NF_ACCEPT;
 }
@@ -271,6 +281,7 @@ static unsigned int zeta_hook_in(unsigned int hooknum, struct sk_buff *skb,
 
     if (th->ack) {
         u32 ack_seq = ntohl(th->ack_seq);
+        zeta_ack_handle_ecn(conn, th, iph);
 
         /* RTT 测量（微秒精度）*/
         if (conn->rtt_measure_start > 0) {
@@ -289,13 +300,18 @@ static unsigned int zeta_hook_in(unsigned int hooknum, struct sk_buff *skb,
 
         /* 更新 snd_una */
         if (zeta_seq_after(ack_seq, conn->snd_una)) {
+            u32 acked = 0;
+            if (conn->last_ack != 0 && zeta_seq_after(ack_seq, conn->last_ack))
+                acked = ack_seq - conn->last_ack;
             conn->snd_una = ack_seq;
-            conn->bytes_acked += ack_seq - conn->last_ack;
+            conn->bytes_acked += acked;
             conn->features.loss_burst_count = 0;
+            zeta_learn_ack_event(conn, ack_seq, true, false);
         }
         /* DupACK 检测 */
         else if (ack_seq == conn->last_ack && conn->last_ack != 0) {
             conn->features.loss_burst_count++;
+            zeta_learn_ack_event(conn, ack_seq, false, true);
             if (conn->features.loss_burst_count == 3) {
                 conn->pkts_lost++;
                 conn->features.loss_total++;
@@ -315,7 +331,11 @@ static unsigned int zeta_hook_in(unsigned int hooknum, struct sk_buff *skb,
         zeta_learn_update(conn, th, 0, true);
     }
 
+    if (th->fin || th->rst)
+        zeta_conn_destroy(conn);
+
     spin_unlock_bh(&conn->lock);
+    zeta_conn_put(conn);
 
     return NF_ACCEPT;
 }

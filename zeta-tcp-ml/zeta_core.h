@@ -14,10 +14,12 @@
 #define _ZETA_CORE_H
 
 #include <linux/types.h>
+#include <linux/atomic.h>
 #include <linux/spinlock.h>
 #include <linux/hashtable.h>
 #include <linux/rculist.h>
 #include <linux/timer.h>
+#include <linux/math64.h>
 #include <linux/netfilter.h>
 #include <linux/netfilter_ipv4.h>
 #include <linux/ip.h>
@@ -60,6 +62,13 @@
 #define ZETA_CWND_MAX               65535
 #define ZETA_MIN_RWND               5840    /* 4 MSS */
 
+/* ========== 概率丢包 / 协同控制配置 ========== */
+#define ZETA_PROB_SCALE             1000
+#define ZETA_LOSS_PROB_HIGH         700
+#define ZETA_LOSS_PROB_MED          400
+#define ZETA_PATH_SCORE_HIGH        70
+#define ZETA_STATE_HOLD_TICKS       5
+
 /* ========== 拥塞状态枚举 ========== */
 typedef enum {
     ZETA_STATE_NORMAL = 0,
@@ -99,6 +108,10 @@ struct zeta_features {
     u32 loss_recent;
     u32 loss_burst_count;
     u32 loss_interval_avg;
+    u32 loss_probability;       /* 0-1000，单连接概率性丢包估计 */
+    u32 random_loss_prob;       /* 0-1000，随机丢包概率 */
+    u32 burst_loss_prob;        /* 0-1000，拥塞/阵发丢包概率 */
+    u32 tail_loss_prob;         /* 0-1000，队尾丢包概率 */
 
     /* 带宽特征 */
     u64 bw_estimate;
@@ -114,7 +127,7 @@ struct zeta_ack_split {
     u32 last_ack_seq;           /* 上次 ACK 的序列号 */
     u64 last_ack_time_us;       /* 上次 ACK 时间（微秒）*/
     u16 split_ratio;            /* 当前分割比例 */
-    u16 accumulated_bytes;      /* 累积字节数 */
+    u32 accumulated_bytes;      /* 累积字节数 */
     bool enabled;               /* 是否启用 */
 };
 
@@ -122,6 +135,8 @@ struct zeta_ack_split {
 struct zeta_conn {
     struct hlist_node   hnode;
     struct rcu_head     rcu;
+    atomic_t            refcnt;
+    bool                closing;
 
     /* 连接标识 */
     __be32              saddr;
@@ -132,7 +147,9 @@ struct zeta_conn {
 
     /* 状态 */
     zeta_cong_state_t   state;
+    zeta_cong_state_t   pending_state;
     zeta_loss_pattern_t loss_pattern;
+    u8                  state_hold_count;
     spinlock_t          lock;
 
     /* 序列号跟踪 */
@@ -140,6 +157,9 @@ struct zeta_conn {
     u32                 snd_nxt;
     u32                 rcv_nxt;
     u32                 last_ack;
+    u32                 dupack_run;
+    u32                 ack_spacing_us;
+    u64                 last_ack_observed_us;
 
     /* RTT 测量（微秒精度）*/
     u64                 rtt_measure_start;
@@ -217,6 +237,9 @@ struct zeta_stats {
     atomic64_t cwnd_reductions;
     atomic64_t learning_decisions;
     atomic64_t batch_flushes;
+    atomic64_t loss_probability_events;
+    atomic64_t reverse_window_adjustments;
+    atomic64_t cross_flow_adjustments;
 };
 
 /* ========== 全局上下文 ========== */
@@ -244,10 +267,19 @@ struct zeta_ctx {
     bool enabled;
     bool verbose;
     bool ack_split_enabled;
+    bool reverse_control_enabled;
+    bool cross_flow_enabled;
     u32 max_rate;
     u32 start_rate;
     u32 batch_size;
     u32 batch_timeout_us;
+
+    /* 跨流协同：全局路径健康度的轻量 EWMA */
+    spinlock_t path_lock;
+    u32 path_rtt_min;
+    u32 path_rtt_avg;
+    u32 path_congestion_score;
+    u32 path_loss_probability;
 };
 
 /* ========== 全局变量声明 ========== */
@@ -299,11 +331,13 @@ static inline bool zeta_seq_after(u32 a, u32 b) {
 
 /* Per-CPU 统计更新（无锁）*/
 static inline void zeta_percpu_stats_inc(u64 __percpu *stat) {
-    this_cpu_inc(*stat);
+    u64 *p = this_cpu_ptr(stat);
+    (*p)++;
 }
 
 static inline void zeta_percpu_stats_add(u64 __percpu *stat, u64 val) {
-    this_cpu_add(*stat, val);
+    u64 *p = this_cpu_ptr(stat);
+    *p += val;
 }
 
 /* ========== 函数声明 ========== */
@@ -314,6 +348,7 @@ struct zeta_conn *zeta_conn_find(__be32 saddr, __be32 daddr,
 struct zeta_conn *zeta_conn_create(__be32 saddr, __be32 daddr,
                                     __be16 sport, __be16 dport);
 void zeta_conn_destroy(struct zeta_conn *conn);
+void zeta_conn_put(struct zeta_conn *conn);
 void zeta_conn_gc(struct timer_list *t);
 void zeta_conn_init(void);
 void zeta_conn_cleanup(void);
@@ -323,6 +358,10 @@ void zeta_learn_update(struct zeta_conn *conn, struct tcphdr *th,
                        int payload_len, bool is_ack);
 zeta_cong_state_t zeta_learn_classify(struct zeta_conn *conn);
 void zeta_learn_rtt_sample(struct zeta_conn *conn, u32 rtt_us);
+void zeta_learn_ack_event(struct zeta_conn *conn, u32 ack_seq,
+                          bool advanced, bool duplicate);
+void zeta_learn_path_update(struct zeta_conn *conn);
+u32 zeta_learn_get_path_score(void);
 u32 zeta_learn_get_cwnd(struct zeta_conn *conn);
 u32 zeta_learn_get_rate(struct zeta_conn *conn);
 

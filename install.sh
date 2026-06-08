@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# LotSpeed v5.6 - Zeta-TCP Auto-Scaling Edition (UI Enhanced)
+# LotSpeed v5.7 - Zeta-TCP Auto-Scaling + ML Edition (UI Enhanced)
 # Author: uk0 @ 2025-11-23
 # GitHub: https://github.com/Zephyr177/lotspeed
 #
@@ -12,10 +12,10 @@ set -e
 
 # ================= 配置区域 =================
 GITHUB_REPO="Zephyr177/lotspeed"
-GITHUB_BRANCH="zeta-tcp"
+GITHUB_BRANCH="${LOTSPEED_BRANCH:-zeta-tcp}"
 INSTALL_DIR="/opt/lotspeed"
 MODULE_NAME="lotspeed"
-VERSION="5.6"
+VERSION="5.7"
 CURRENT_TIME=$(date '+%Y-%m-%d %H:%M:%S')
 CURRENT_USER=$(whoami)
 KERNEL_BUILD_DIR="/lib/modules/$(uname -r)/build"
@@ -149,8 +149,8 @@ print_banner() {
 ║     |_____\___/ \__|____/| .__/ \___|\___|\__,_|                     ║
 ║                          |_|                                         ║
 ║                                                                      ║
-║               Zeta-TCP Auto-Scaling Edition                          ║
-║                       Version 5.6rc                                  ║
+║             Zeta-TCP Auto-Scaling + ML Edition                       ║
+║                       Version 5.7                                    ║
 ╚══════════════════════════════════════════════════════════════════════╝
 EOF
     echo -e "${NC}"
@@ -216,15 +216,15 @@ install_dependencies() {
     fi
 
     if [[ "$OS" == "centos" ]]; then
-        yum install -y $compiler_pkgs make kernel-devel-$(uname -r) kernel-headers-$(uname -r) wget curl bc 2>/dev/null || {
+        yum install -y $compiler_pkgs make kernel-devel-$(uname -r) kernel-headers-$(uname -r) elfutils-libelf-devel wget curl bc 2>/dev/null || {
             log_warn "Some packages may be missing, trying alternative..."
-            yum install -y $compiler_pkgs make kernel-devel kernel-headers wget curl bc
+            yum install -y $compiler_pkgs make kernel-devel kernel-headers elfutils-libelf-devel wget curl bc
         }
     elif [[ "$OS" == "debian" ]] || [[ "$OS" == "ubuntu" ]]; then
         apt-get update >/dev/null 2>&1
-        apt-get install -y $compiler_pkgs make linux-headers-$(uname -r) wget curl bc 2>/dev/null || {
+        apt-get install -y $compiler_pkgs make linux-headers-$(uname -r) libelf-dev wget curl bc 2>/dev/null || {
             log_warn "Some packages may be missing, trying alternative..."
-            apt-get install -y $compiler_pkgs make linux-headers-generic wget curl bc
+            apt-get install -y $compiler_pkgs make linux-headers-generic libelf-dev wget curl bc
         }
     fi
 
@@ -294,6 +294,7 @@ load_module() {
 
     # 卸载旧模块（如果存在）
     rmmod lotspeed 2>/dev/null || true
+    rmmod zeta_tcp 2>/dev/null || true
 
     # 加载新模块
     insmod $INSTALL_DIR/lotspeed.ko || {
@@ -329,7 +330,7 @@ create_management_script() {
 
 ACTION=$1
 INSTALL_DIR="/opt/lotspeed"
-VERSION="5.6"
+VERSION="5.7"
 
 # 颜色
 RED='\033[0;31m'
@@ -501,7 +502,8 @@ show_status() {
     if [[ -d /sys/module/lotspeed/parameters ]]; then
         for param in lotserver_rate lotserver_start_rate lotserver_gain lotserver_min_cwnd \
                      lotserver_max_cwnd lotserver_beta lotserver_adaptive lotserver_turbo \
-                     lotserver_verbose lotserver_safe_mode; do
+                     lotserver_verbose lotserver_safe_mode lotserver_zeta_ml \
+                     lotserver_cross_flow lotserver_loss_prob_thresh; do
 
             param_file="/sys/module/lotspeed/parameters/$param"
             if [[ -f "$param_file" ]]; then
@@ -525,6 +527,9 @@ show_status() {
                     lotserver_beta)
                         beta_val=$((value * 100 / 1024))
                         print_kv_row "Fairness (Beta)" "${beta_val}%"
+                        ;;
+                    lotserver_loss_prob_thresh)
+                        print_kv_row "Loss Probability Thresh" "$value / 1000"
                         ;;
                     lotserver_min_cwnd)
                         print_kv_row "Min CWND" "$value packets"
@@ -560,6 +565,20 @@ show_status() {
                             print_kv_row "Safe Mode" "Disabled"
                         fi
                         ;;
+                    lotserver_zeta_ml)
+                        if [[ "$value" == "Y" ]] || [[ "$value" == "1" ]]; then
+                            print_kv_row "Zeta-ML" "${GREEN}Enabled${NC}"
+                        else
+                            print_kv_row "Zeta-ML" "${YELLOW}Disabled${NC}"
+                        fi
+                        ;;
+                    lotserver_cross_flow)
+                        if [[ "$value" == "Y" ]] || [[ "$value" == "1" ]]; then
+                            print_kv_row "Cross-Flow Sharing" "${GREEN}Enabled${NC}"
+                        else
+                            print_kv_row "Cross-Flow Sharing" "${YELLOW}Disabled${NC}"
+                        fi
+                        ;;
                 esac
             fi
         done
@@ -572,7 +591,8 @@ apply_preset() {
 
     # 模拟设置参数 (实际写入 sysfs)
     set_val() {
-        echo $2 > /sys/module/lotspeed/parameters/$1 2>/dev/null
+        local param_file="/sys/module/lotspeed/parameters/$1"
+        [[ -f "$param_file" ]] && echo $2 > "$param_file" 2>/dev/null
     }
 
     print_box_top
@@ -590,6 +610,9 @@ apply_preset() {
             set_val lotserver_adaptive 1
             set_val lotserver_turbo 0
             set_val lotserver_safe_mode 1
+            set_val lotserver_zeta_ml 1
+            set_val lotserver_cross_flow 1
+            set_val lotserver_loss_prob_thresh 750
             print_box_row "Applied: Conservative (1Gbps, 1.5x, Safe)" "left"
             ;;
         balanced)
@@ -602,12 +625,15 @@ apply_preset() {
             set_val lotserver_adaptive 1
             set_val lotserver_turbo 0
             set_val lotserver_safe_mode 1
+            set_val lotserver_zeta_ml 1
+            set_val lotserver_cross_flow 1
+            set_val lotserver_loss_prob_thresh 650
             print_box_row "Applied: Balanced (2.5Gbps, 2.0x, Adaptive)" "left"
             ;;
         *)
             print_box_row "Unknown preset: $PRESET" "left" "${RED}"
             print_box_div
-            print_box_row "Available: conservative, balanced," "left"
+            print_box_row "Available: conservative, balanced" "left"
             print_box_bottom
             exit 1
             ;;
@@ -629,8 +655,11 @@ set_param() {
         print_box_row "Example: lotspeed set lotserver_min_cwnd 16" "left"
         print_box_row "Example: lotspeed set lotserver_max_cwnd 15000" "left"
         print_box_row "Example: lotspeed set lotserver_beta 717" "left"
+        print_box_row "Example: lotspeed set lotserver_loss_prob_thresh 650" "left"
         print_box_row "Example: lotspeed set lotserver_verbose 1/0" "left"
         print_box_row "Example: lotspeed set lotserver_safe_mode 1/0" "left"
+        print_box_row "Example: lotspeed set lotserver_zeta_ml 1/0" "left"
+        print_box_row "Example: lotspeed set lotserver_cross_flow 1/0" "left"
         print_box_bottom
         exit 1
     fi
@@ -652,6 +681,7 @@ set_param() {
 
 case "$ACTION" in
     start)
+        rmmod zeta_tcp 2>/dev/null || true
         modprobe lotspeed 2>/dev/null || insmod $INSTALL_DIR/lotspeed.ko
         sysctl -w net.ipv4.tcp_congestion_control=lotspeed >/dev/null
         print_box_top "${GREEN}"
@@ -661,6 +691,7 @@ case "$ACTION" in
     stop)
         DEFAULT_ALGO=$(get_default_congestion_control)
         sysctl -w net.ipv4.tcp_congestion_control=$DEFAULT_ALGO >/dev/null 2>&1
+        rmmod zeta_tcp 2>/dev/null || true
         rmmod lotspeed 2>/dev/null
         print_box_top "${YELLOW}"
         print_box_row "LotSpeed Stopped" "center" "${YELLOW}"
@@ -702,6 +733,7 @@ case "$ACTION" in
         sysctl -w net.ipv4.tcp_congestion_control=$DEFAULT_ALGO >/dev/null 2>&1
 
         # 尝试卸载模块
+        rmmod zeta_tcp 2>/dev/null || true
         if rmmod lotspeed 2>/dev/null; then
             print_kv_row "Module Unload" "${GREEN}Success${NC}" "${MAGENTA}"
         else
@@ -717,7 +749,9 @@ case "$ACTION" in
         print_box_row "Removing files..." "left" "${MAGENTA}"
         rm -rf $INSTALL_DIR
         rm -f /etc/modules-load.d/lotspeed.conf
+        rm -f /etc/modules-load.d/zeta_tcp.conf
         rm -f /lib/modules/$(uname -r)/kernel/net/ipv4/lotspeed.ko
+        rm -f /lib/modules/$(uname -r)/kernel/net/ipv4/zeta_tcp.ko
         depmod -a
         sed -i '/net.ipv4.tcp_congestion_control=lotspeed/d' /etc/sysctl.conf
 
@@ -730,7 +764,7 @@ case "$ACTION" in
             # 内嵌的重启提示框
             print_box_row "" "center" "${MAGENTA}"
             print_box_row "${RED} ${NC}" "center" "${MAGENTA}"
-            print_box_row "${RED}REBOOT REQUIRED{NC}" "center" "${MAGENTA}"
+            print_box_row "${RED}REBOOT REQUIRED${NC}" "center" "${MAGENTA}"
             print_box_row "${RED}Module will be completely removed${NC}" "center" "${MAGENTA}"
             print_box_row "${RED}after system reboot.${NC}" "center" "${MAGENTA}"
             print_box_row "" "center" "${MAGENTA}"
@@ -790,7 +824,7 @@ show_info() {
     echo ""
     print_box_top "${GREEN}"
     print_box_row "LotSpeed v$VERSION Installation Complete!" "center" "${GREEN}"
-    print_box_row "Zeta-TCP Auto-Scaling Edition" "center" "${GREEN}"
+    print_box_row "Zeta-TCP Auto-Scaling + ML Edition" "center" "${GREEN}"
     print_box_bottom "${GREEN}"
 
     echo ""

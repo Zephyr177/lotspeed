@@ -46,6 +46,8 @@ static int zeta_proc_stats_show(struct seq_file *m, void *v)
     seq_printf(m, "Enabled: %s\n", g_zeta->enabled ? "yes" : "no");
     seq_printf(m, "Verbose: %s\n", g_zeta->verbose ? "yes" : "no");
     seq_printf(m, "ACK Splitting: %s\n", g_zeta->ack_split_enabled ? "yes" : "no");
+    seq_printf(m, "Reverse Control: %s\n", g_zeta->reverse_control_enabled ? "yes" : "no");
+    seq_printf(m, "Cross-Flow: %s\n", g_zeta->cross_flow_enabled ? "yes" : "no");
     seq_printf(m, "CPUs: %d\n", num_possible_cpus());
     seq_printf(m, "\n");
 
@@ -65,10 +67,20 @@ static int zeta_proc_stats_show(struct seq_file *m, void *v)
     seq_printf(m, "  Suppressed: %llu\n", total_suppressed);
     seq_printf(m, "  Split:      %llu\n", total_split);
     seq_printf(m, "  CWND Reductions: %lld\n", atomic64_read(&g_zeta->stats.cwnd_reductions));
+    seq_printf(m, "  Reverse Window Adjustments: %lld\n",
+               atomic64_read(&g_zeta->stats.reverse_window_adjustments));
     seq_printf(m, "\n");
 
     seq_printf(m, "[Learning Engine]\n");
     seq_printf(m, "  Decisions:  %lld\n", atomic64_read(&g_zeta->stats.learning_decisions));
+    seq_printf(m, "  Loss Probability Events: %lld\n",
+               atomic64_read(&g_zeta->stats.loss_probability_events));
+    seq_printf(m, "  Cross-Flow Adjustments: %lld\n",
+               atomic64_read(&g_zeta->stats.cross_flow_adjustments));
+    seq_printf(m, "  Path RTT min/avg: %u/%u us\n",
+               g_zeta->path_rtt_min, g_zeta->path_rtt_avg);
+    seq_printf(m, "  Path score/loss probability: %u/%u\n",
+               g_zeta->path_congestion_score, g_zeta->path_loss_probability);
 
     return 0;
 }
@@ -156,6 +168,8 @@ static int zeta_proc_config_show(struct seq_file *m, void *v)
     seq_printf(m, "enabled=%d\n", g_zeta->enabled ?  1 : 0);
     seq_printf(m, "verbose=%d\n", g_zeta->verbose ? 1 : 0);
     seq_printf(m, "ack_split=%d\n", g_zeta->ack_split_enabled ? 1 : 0);
+    seq_printf(m, "reverse_control=%d\n", g_zeta->reverse_control_enabled ? 1 : 0);
+    seq_printf(m, "cross_flow=%d\n", g_zeta->cross_flow_enabled ? 1 : 0);
     seq_printf(m, "max_rate=%u\n", g_zeta->max_rate);
     seq_printf(m, "start_rate=%u\n", g_zeta->start_rate);
     seq_printf(m, "batch_size=%u\n", g_zeta->batch_size);
@@ -198,6 +212,12 @@ static ssize_t zeta_proc_config_write(struct file *file, const char __user *buf,
     } else if (strcmp(key, "ack_split") == 0) {
         g_zeta->ack_split_enabled = (simple_strtoul(val, NULL, 10) != 0);
         ZETA_LOG("ack_split = %d\n", g_zeta->ack_split_enabled);
+    } else if (strcmp(key, "reverse_control") == 0) {
+        g_zeta->reverse_control_enabled = (simple_strtoul(val, NULL, 10) != 0);
+        ZETA_LOG("reverse_control = %d\n", g_zeta->reverse_control_enabled);
+    } else if (strcmp(key, "cross_flow") == 0) {
+        g_zeta->cross_flow_enabled = (simple_strtoul(val, NULL, 10) != 0);
+        ZETA_LOG("cross_flow = %d\n", g_zeta->cross_flow_enabled);
     } else if (strcmp(key, "max_rate") == 0) {
         g_zeta->max_rate = simple_strtoul(val, NULL, 10);
         ZETA_LOG("max_rate = %u\n", g_zeta->max_rate);
@@ -251,9 +271,9 @@ static int zeta_proc_conns_show(struct seq_file *m, void *v)
     if (!g_zeta)
         return -ENODEV;
 
-    seq_printf(m, "%-21s %-21s %-10s %-6s %-8s %-8s %-4s\n",
-               "Source", "Destination", "State", "Score", "Sent", "Lost", "CPU");
-    seq_printf(m, "--------------------------------------------------------------------------\n");
+    seq_printf(m, "%-21s %-21s %-10s %-6s %-6s %-8s %-8s %-4s\n",
+               "Source", "Destination", "State", "Score", "LProb", "Sent", "Lost", "CPU");
+    seq_printf(m, "---------------------------------------------------------------------------------\n");
 
     rcu_read_lock();
     hash_for_each_rcu(g_zeta->conn_table, bkt, conn, hnode) {
@@ -263,11 +283,12 @@ static int zeta_proc_conns_show(struct seq_file *m, void *v)
             break;
         }
 
-        seq_printf(m, "%pI4:%-5u %pI4:%-5u %-10s %-6u %-8u %-8u %-4d\n",
+        seq_printf(m, "%pI4:%-5u %pI4:%-5u %-10s %-6u %-6u %-8u %-8u %-4d\n",
                    &conn->saddr, ntohs(conn->sport),
                    &conn->daddr, ntohs(conn->dport),
                    state_names[conn->state],
                    conn->features.congestion_score,
+                   conn->features.loss_probability,
                    conn->pkts_sent,
                    conn->pkts_lost,
                    conn->preferred_cpu);

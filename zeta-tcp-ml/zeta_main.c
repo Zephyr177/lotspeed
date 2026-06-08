@@ -24,6 +24,14 @@ static bool ack_split = true;
 module_param(ack_split, bool, 0644);
 MODULE_PARM_DESC(ack_split, "Enable ACK Splitting (default: true)");
 
+static bool reverse_control = true;
+module_param(reverse_control, bool, 0644);
+MODULE_PARM_DESC(reverse_control, "Enable conservative reverse-path ACK/RWND control");
+
+static bool cross_flow = true;
+module_param(cross_flow, bool, 0644);
+MODULE_PARM_DESC(cross_flow, "Enable lightweight cross-flow path coordination");
+
 static unsigned int max_rate = 125000000;
 module_param(max_rate, uint, 0644);
 MODULE_PARM_DESC(max_rate, "Max rate bytes/s (default: 1Gbps)");
@@ -47,15 +55,22 @@ static int zeta_ctx_init(void)
 
     hash_init(g_zeta->conn_table);
     spin_lock_init(&g_zeta->conn_lock);
+    spin_lock_init(&g_zeta->path_lock);
     atomic_set(&g_zeta->conn_count, 0);
 
     g_zeta->enabled = enable;
     g_zeta->verbose = verbose;
     g_zeta->ack_split_enabled = ack_split;
+    g_zeta->reverse_control_enabled = reverse_control;
+    g_zeta->cross_flow_enabled = cross_flow;
     g_zeta->max_rate = max_rate;
     g_zeta->start_rate = start_rate;
     g_zeta->batch_size = batch_size;
     g_zeta->batch_timeout_us = ZETA_BATCH_TIMEOUT_US;
+    g_zeta->path_rtt_min = 0;
+    g_zeta->path_rtt_avg = 0;
+    g_zeta->path_congestion_score = 0;
+    g_zeta->path_loss_probability = 0;
 
     /* 初始化统计 */
     atomic64_set(&g_zeta->stats.conns_total, 0);
@@ -69,6 +84,9 @@ static int zeta_ctx_init(void)
     atomic64_set(&g_zeta->stats.cwnd_reductions, 0);
     atomic64_set(&g_zeta->stats.learning_decisions, 0);
     atomic64_set(&g_zeta->stats.batch_flushes, 0);
+    atomic64_set(&g_zeta->stats.loss_probability_events, 0);
+    atomic64_set(&g_zeta->stats.reverse_window_adjustments, 0);
+    atomic64_set(&g_zeta->stats.cross_flow_adjustments, 0);
 
     return 0;
 }
@@ -121,6 +139,8 @@ static int __init zeta_module_init(void)
     ZETA_LOG("  CPUs: %d\n", num_possible_cpus());
     ZETA_LOG("  Max Rate: %u Mbps\n", g_zeta->max_rate * 8 / 1000000);
     ZETA_LOG("  ACK Splitting: %s\n", g_zeta->ack_split_enabled ? "enabled" : "disabled");
+    ZETA_LOG("  Reverse Control: %s\n", g_zeta->reverse_control_enabled ? "enabled" : "disabled");
+    ZETA_LOG("  Cross-Flow: %s\n", g_zeta->cross_flow_enabled ? "enabled" : "disabled");
     ZETA_LOG("  Batch Size: %u\n", g_zeta->batch_size);
 
     return 0;
@@ -172,5 +192,5 @@ module_exit(zeta_module_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("uk0");
-MODULE_DESCRIPTION("Zeta-TCP: High-Performance TCP Accelerator with per-CPU and ACK Splitting");
+MODULE_DESCRIPTION("Zeta-TCP ML: Learning TCP Accelerator with ACK/RWND Control");
 MODULE_VERSION(ZETA_VERSION);

@@ -7,9 +7,12 @@
 #include <linux/kernel.h>
 #include <linux/skbuff.h>
 #include <linux/ip.h>
+#include <linux/if_ether.h>
 #include <linux/version.h>
 #include <net/tcp.h>
 #include <net/ip.h>
+#include <net/dst.h>
+#include <net/inet_ecn.h>
 #include "zeta_core.h"
 
 /* ========== 稳定性配置 ========== */
@@ -40,8 +43,7 @@ void zeta_ack_split_init(struct zeta_conn *conn)
  * 
  * 返回值:
  *   0 - 继续正常处理
- *   1 - ACK 已被延迟/合并，不发送
- *   2 - 需要发送额外的 ACK
+ *   1 - 建议合并 ACK；当前实现不直接丢包，避免无定时器兜底时卡住连接
  */
 int zeta_ack_split_process(struct zeta_conn *conn, struct sk_buff *skb,
                            struct tcphdr *th, int payload_len)
@@ -50,7 +52,11 @@ int zeta_ack_split_process(struct zeta_conn *conn, struct sk_buff *skb,
     u64 now_us = zeta_now_us();
     u32 ack_seq = ntohl(th->ack_seq);
     u32 bytes_acked;
+    u32 path_score;
     int result = 0;
+
+    (void)skb;
+    (void)payload_len;
 
     if (!split->enabled)
         return 0;
@@ -66,6 +72,8 @@ int zeta_ack_split_process(struct zeta_conn *conn, struct sk_buff *skb,
     split->pending_acks++;
 
     /* 根据拥塞状态调整分割策略 */
+    path_score = zeta_learn_get_path_score();
+
     switch (conn->state) {
         case ZETA_STATE_NORMAL:
         case ZETA_STATE_STABLE_DELAY:
@@ -75,7 +83,7 @@ int zeta_ack_split_process(struct zeta_conn *conn, struct sk_buff *skb,
 
         case ZETA_STATE_DELAY_RISING:
             /* 延迟上升：适度延迟 ACK */
-            split->split_ratio = 2;
+            split->split_ratio = (path_score >= ZETA_PATH_SCORE_HIGH) ? 3 : 2;
             break;
 
         case ZETA_STATE_BURST_LOSS:
@@ -132,6 +140,8 @@ void zeta_ack_split_flush(struct zeta_conn *conn, struct sk_buff *skb)
 {
     struct zeta_ack_split *split = &conn->ack_split;
 
+    (void)skb;
+
     if (!split->enabled)
         return;
 
@@ -167,24 +177,38 @@ void zeta_ack_modify_rwnd(struct zeta_conn *conn, struct tcphdr *th)
     u16 new_rwnd;
     u32 target_scale = 100;
     u32 smooth_scale_val;
+    u32 path_score;
+    u32 loss_prob;
     const char *reason = "default";
 
+    if (g_zeta && !g_zeta->reverse_control_enabled)
+        return;
+
+    path_score = zeta_learn_get_path_score();
+    loss_prob = conn->features.loss_probability;
+
     if (g_zeta && g_zeta->verbose) {
-        ZETA_LOG("[%pI4:%u] modify_rwnd: orig=%u state=%d score=%u loss=%u\n",
+        ZETA_LOG("[%pI4:%u] modify_rwnd: orig=%u state=%d score=%u loss=%u prob=%u path=%u\n",
                  &conn->daddr, ntohs(conn->dport),
                  orig_rwnd, conn->state,
                  conn->features.congestion_score,
-                 conn->features.loss_total);
+                 conn->features.loss_total, loss_prob, path_score);
     }
 
     switch (conn->state) {
         case ZETA_STATE_NORMAL:
-            if (conn->features.loss_total > 5) {
+            if (loss_prob >= ZETA_LOSS_PROB_HIGH) {
+                target_scale = 75;
+                reason = "NORMAL+prob-loss";
+            } else if (conn->features.loss_total > 5) {
                 target_scale = 80;
                 reason = "NORMAL+loss";
             } else if (conn->features.congestion_score > 40) {
                 target_scale = 90;
                 reason = "NORMAL+score";
+            } else if (path_score >= ZETA_PATH_SCORE_HIGH) {
+                target_scale = 92;
+                reason = "NORMAL+path";
             } else {
                 target_scale = 100;
                 reason = "NORMAL";
@@ -192,9 +216,9 @@ void zeta_ack_modify_rwnd(struct zeta_conn *conn, struct tcphdr *th)
             break;
 
         case ZETA_STATE_RANDOM_LOSS:
-            if (conn->features.loss_total > 15) {
+            if (loss_prob >= 850) {
                 target_scale = 65;
-            } else if (conn->features.loss_total > 8) {
+            } else if (loss_prob >= ZETA_LOSS_PROB_HIGH || conn->features.loss_total > 8) {
                 target_scale = 75;
             } else if (conn->features.loss_total > 3) {
                 target_scale = 85;
@@ -205,14 +229,17 @@ void zeta_ack_modify_rwnd(struct zeta_conn *conn, struct tcphdr *th)
             break;
 
         case ZETA_STATE_STABLE_DELAY:
-            target_scale = (conn->features.congestion_score > 60) ? 80 : 90;
+            if (path_score >= ZETA_PATH_SCORE_HIGH)
+                target_scale = 85;
+            else
+                target_scale = (conn->features.congestion_score > 60) ? 80 : 90;
             reason = "STABLE_DELAY";
             break;
 
         case ZETA_STATE_DELAY_RISING:
-            if (conn->features.congestion_score >= 90) {
+            if (loss_prob >= 900 || conn->features.congestion_score >= 90) {
                 target_scale = 40;
-            } else if (conn->features.congestion_score >= 70) {
+            } else if (loss_prob >= ZETA_LOSS_PROB_HIGH || conn->features.congestion_score >= 70) {
                 target_scale = 55;
             } else if (conn->features.congestion_score >= 50) {
                 target_scale = 65;
@@ -223,9 +250,9 @@ void zeta_ack_modify_rwnd(struct zeta_conn *conn, struct tcphdr *th)
             break;
 
         case ZETA_STATE_BURST_LOSS:
-            if (conn->features.congestion_score >= 95) {
+            if (loss_prob >= 950 || conn->features.congestion_score >= 95) {
                 target_scale = 30;
-            } else if (conn->features.congestion_score >= 80) {
+            } else if (loss_prob >= 850 || conn->features.congestion_score >= 80) {
                 target_scale = 40;
             } else if (conn->features.congestion_score >= 60) {
                 target_scale = 50;
@@ -257,14 +284,21 @@ void zeta_ack_modify_rwnd(struct zeta_conn *conn, struct tcphdr *th)
     /* 计算新窗口 */
     new_rwnd = (u16)zeta_div32((u32)orig_rwnd * smooth_scale_val, 100);
 
-    /* 保证最小窗口 */
-    if (new_rwnd < ZETA_MIN_RWND)
+    if (orig_rwnd == 0)
+        return;
+
+    /* 保证最小窗口，但不把真实零窗口或小窗口强行放大。 */
+    if (orig_rwnd >= ZETA_MIN_RWND && new_rwnd < ZETA_MIN_RWND)
         new_rwnd = ZETA_MIN_RWND;
+    if (new_rwnd > orig_rwnd)
+        new_rwnd = orig_rwnd;
 
     conn->ack_rwnd_scale = (u16)smooth_scale_val;
 
     if (new_rwnd != orig_rwnd) {
         th->window = htons(new_rwnd);
+        if (g_zeta)
+            atomic64_inc(&g_zeta->stats.reverse_window_adjustments);
 
         if (g_zeta && g_zeta->verbose) {
             ZETA_LOG("[%pI4:%u] RWND: %u -> %u (scale=%u%% reason=%s)\n",
@@ -277,13 +311,17 @@ void zeta_ack_modify_rwnd(struct zeta_conn *conn, struct tcphdr *th)
 /* ========== ACK 抑制判断 ========== */
 bool zeta_ack_should_suppress(struct zeta_conn *conn)
 {
+    if (g_zeta && !g_zeta->reverse_control_enabled)
+        return false;
+
     if (conn->state != ZETA_STATE_BURST_LOSS)
         return false;
 
     if (conn->ack_suppress_count >= 2)
         return false;
 
-    if (conn->features.congestion_score >= 99) {
+    if (conn->features.congestion_score >= 99 &&
+        conn->features.loss_probability >= 900) {
         conn->ack_suppress_count++;
         
         if (g_zeta && g_zeta->percpu_stats) {
@@ -291,9 +329,11 @@ bool zeta_ack_should_suppress(struct zeta_conn *conn)
             stats->acks_suppressed++;
         }
         
-        ZETA_LOG("[%pI4:%u] ACK SUPPRESSED count=%u\n",
-                 &conn->daddr, ntohs(conn->dport),
-                 conn->ack_suppress_count);
+        if (g_zeta && g_zeta->verbose) {
+            ZETA_LOG("[%pI4:%u] ACK SUPPRESSED count=%u\n",
+                     &conn->daddr, ntohs(conn->dport),
+                     conn->ack_suppress_count);
+        }
         return true;
     }
 
@@ -326,6 +366,8 @@ int zeta_ack_process(struct zeta_conn *conn, struct sk_buff *skb,
     if (!conn || !th)
         return 0;
 
+    (void)skb;
+
     /* 1.抑制检查 */
     if (zeta_ack_should_suppress(conn)) {
         return -1;
@@ -343,15 +385,8 @@ int zeta_ack_process(struct zeta_conn *conn, struct sk_buff *skb,
     /* 5.检查修改 */
     new_rwnd = ntohs(th->window);
 
-    if (new_rwnd != orig_rwnd) {
+    if (new_rwnd != orig_rwnd)
         modified = 1;
-        
-        /* 更新 per-CPU 统计 */
-        if (g_zeta && g_zeta->percpu_stats) {
-            struct zeta_percpu_stats *stats = this_cpu_ptr(g_zeta->percpu_stats);
-            stats->pkts_modified++;
-        }
-    }
 
     /* 6.重置计数 */
     if (conn->state == ZETA_STATE_NORMAL) {
@@ -428,7 +463,8 @@ void zeta_ack_generate_dupack(struct zeta_conn *conn, struct sk_buff *orig_skb)
                              csum_partial((char *)th, tcp_hdr_len, 0));
 
     nskb->protocol = htons(ETH_P_IP);
-    skb_dst_set(nskb, dst_clone(skb_dst(orig_skb)));
+    if (skb_dst(orig_skb))
+        skb_dst_set(nskb, dst_clone(skb_dst(orig_skb)));
 
     ip_local_out(&init_net, NULL, nskb);
 

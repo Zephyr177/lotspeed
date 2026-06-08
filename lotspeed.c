@@ -1,6 +1,6 @@
 /*
- * lotspeed_zeta_v5_6.c
- * "公路超跑" Zeta-TCP (Auto-Scaling Edition)
+ * lotspeed_zeta_v5_7.c
+ * "公路超跑" Zeta-TCP (Auto-Scaling + ML Edition)
  * Author: uk0
  *
  * Feature:
@@ -8,6 +8,7 @@
  * 2. Auto Scaling: Automatically climbs up if the pipe is healthy, finding the true bottleneck.
  * 3. Global Cap: Individual connection rate never exceeds 'lotserver_rate' (1Gbps).
  * 4. Smart Guard: Includes Loss Rate Cap & BDP Cap from v5.3/v5.4.
+ * 5. Zeta-ML: probabilistic loss classification and cross-flow path sharing.
  */
 
 #include <linux/module.h>
@@ -57,6 +58,9 @@
 #define ZETA_ALPHA 85
 #define ZETA_PROBE_GAIN 110
 #define ZETA_MIN_SAMPLES 10
+#define ZETA_ML_PROB_SCALE 1000
+#define ZETA_ML_DECAY_NUM 7
+#define ZETA_ML_DECAY_DEN 8
 
 // --- 保护阈值 (Smart Guard) ---
 #define LOSS_RATE_CAP_PERCENT 15     // 丢包率熔断阈值 (15%)
@@ -93,6 +97,9 @@ static bool lotserver_adaptive = true;
 static bool lotserver_turbo = false;
 static bool lotserver_verbose = false;
 static bool lotserver_safe_mode = true;
+static bool lotserver_zeta_ml = true;
+static bool lotserver_cross_flow = true;
+static unsigned int lotserver_loss_prob_thresh = 650;
 
 // --- 参数回调 ---
 static int param_set_rate(const char *val, const struct kernel_param *kp) { return param_set_ulong(val, kp); }
@@ -117,6 +124,12 @@ static int param_set_beta(const char *val, const struct kernel_param *kp) {
     }
     return ret;
 }
+static int param_set_loss_prob_thresh(const char *val, const struct kernel_param *kp) {
+    int ret = param_set_uint(val, kp);
+    if (!ret && lotserver_loss_prob_thresh > ZETA_ML_PROB_SCALE)
+        lotserver_loss_prob_thresh = ZETA_ML_PROB_SCALE;
+    return ret;
+}
 
 static const struct kernel_param_ops param_ops_rate = { .set = param_set_rate, .get = param_get_ulong, };
 static const struct kernel_param_ops param_ops_gain = { .set = param_set_gain, .get = param_get_uint, };
@@ -125,6 +138,7 @@ static const struct kernel_param_ops param_ops_max_cwnd = { .set = param_set_max
 static const struct kernel_param_ops param_ops_adaptive = { .set = param_set_adaptive, .get = param_get_bool, };
 static const struct kernel_param_ops param_ops_turbo = { .set = param_set_turbo, .get = param_get_bool, };
 static const struct kernel_param_ops param_ops_beta = { .set = param_set_beta, .get = param_get_uint, };
+static const struct kernel_param_ops param_ops_loss_prob_thresh = { .set = param_set_loss_prob_thresh, .get = param_get_uint, };
 
 module_param_cb(lotserver_rate, &param_ops_rate, &lotserver_rate, 0644);
 module_param_cb(lotserver_start_rate, &param_ops_rate, &lotserver_start_rate, 0644); // 新增
@@ -134,14 +148,26 @@ module_param_cb(lotserver_max_cwnd, &param_ops_max_cwnd, &lotserver_max_cwnd, 06
 module_param_cb(lotserver_adaptive, &param_ops_adaptive, &lotserver_adaptive, 0644);
 module_param_cb(lotserver_turbo, &param_ops_turbo, &lotserver_turbo, 0644);
 module_param_cb(lotserver_beta, &param_ops_beta, &lotserver_beta, 0644);
+module_param_cb(lotserver_loss_prob_thresh, &param_ops_loss_prob_thresh, &lotserver_loss_prob_thresh, 0644);
 module_param(lotserver_verbose, bool, 0644);
 module_param(lotserver_safe_mode, bool, 0644);
+module_param(lotserver_zeta_ml, bool, 0644);
+module_param(lotserver_cross_flow, bool, 0644);
 
 // --- 全局统计 ---
 static atomic_t active_connections = ATOMIC_INIT(0);
 static atomic64_t total_bytes_sent = ATOMIC64_INIT(0);
 static atomic_t total_losses = ATOMIC_INIT(0);
 static atomic_t history_entries_count = ATOMIC_INIT(0);
+static atomic_t zeta_ml_loss_events = ATOMIC_INIT(0);
+static atomic_t zeta_ml_cross_flow_events = ATOMIC_INIT(0);
+
+// --- 跨流路径协同 ---
+static DEFINE_SPINLOCK(zeta_path_lock);
+static u32 zeta_path_rtt_min;
+static u32 zeta_path_rtt_avg;
+static u32 zeta_path_loss_probability;
+static u32 zeta_path_congestion_score;
 
 // --- ZETA 学习引擎结构 ---
 struct zeta_history_entry {
@@ -207,12 +233,92 @@ struct lotspeed {
     u32 packet_window_count;
     u32 loss_window_count;
 
+    // Zeta-ML 概率丢包分类，0-1000
+    u16 loss_probability;
+    u16 random_loss_probability;
+    u16 burst_loss_probability;
+    u16 tail_loss_probability;
+
     enum lotspeed_state state;
 
     // 3. 1字节对齐字段 (bool)
     bool ss_mode;
     bool history_hit;
 };
+
+static inline u32 zeta_ewma_u32(u32 old, u32 sample, u32 weight)
+{
+    if (!old)
+        return sample;
+    return (old * (weight - 1) + sample) / weight;
+}
+
+static inline u16 zeta_decay_prob(u16 prob)
+{
+    return (u16)((prob * ZETA_ML_DECAY_NUM) / ZETA_ML_DECAY_DEN);
+}
+
+static inline void zeta_raise_prob(u16 *prob, u32 delta)
+{
+    u32 next = *prob + delta;
+    *prob = (u16)min_t(u32, next, ZETA_ML_PROB_SCALE);
+}
+
+static u32 zeta_path_score_read(void)
+{
+    u32 score;
+    unsigned long flags;
+
+    if (!lotserver_zeta_ml || !lotserver_cross_flow)
+        return 0;
+
+    spin_lock_irqsave(&zeta_path_lock, flags);
+    score = max(zeta_path_congestion_score, zeta_path_loss_probability);
+    spin_unlock_irqrestore(&zeta_path_lock, flags);
+
+    return min_t(u32, score, ZETA_ML_PROB_SCALE);
+}
+
+static void zeta_path_update(struct lotspeed *ca)
+{
+    u32 score;
+    unsigned long flags;
+
+    if (!lotserver_zeta_ml || !lotserver_cross_flow || !ca)
+        return;
+
+    score = max_t(u32, ca->burst_loss_probability, ca->tail_loss_probability);
+    score = max_t(u32, score, ca->loss_probability);
+
+    spin_lock_irqsave(&zeta_path_lock, flags);
+    if (ca->rtt_min &&
+        (!zeta_path_rtt_min || ca->rtt_min < zeta_path_rtt_min))
+        zeta_path_rtt_min = ca->rtt_min;
+    if (ca->rtt_median)
+        zeta_path_rtt_avg = zeta_ewma_u32(zeta_path_rtt_avg, ca->rtt_median, 8);
+    zeta_path_loss_probability = zeta_ewma_u32(zeta_path_loss_probability, ca->loss_probability, 8);
+    zeta_path_congestion_score = zeta_ewma_u32(zeta_path_congestion_score, score, 8);
+    spin_unlock_irqrestore(&zeta_path_lock, flags);
+}
+
+static u32 lotspeed_local_congestion_prob(struct lotspeed *ca)
+{
+    u32 score;
+
+    if (!lotserver_zeta_ml || !ca)
+        return 0;
+
+    score = max_t(u32, ca->burst_loss_probability, ca->tail_loss_probability);
+
+    /*
+     * 随机丢包不一定是拥塞。只有在整体丢包概率已经很高时，
+     * 才让 random component 轻量参与收敛。
+     */
+    if (ca->loss_probability > lotserver_loss_prob_thresh)
+        score = max_t(u32, score, ca->loss_probability / 2);
+
+    return min_t(u32, score, ZETA_ML_PROB_SCALE);
+}
 
 // --- 安全的历史引擎函数 ---
 static void __maybe_unused free_history_entry_rcu(struct rcu_head *head)
@@ -421,6 +527,86 @@ static void lotspeed_update_rtt(struct sock *sk, u32 rtt_us)
     ca->sample_count++;
 }
 
+static void lotspeed_update_loss_probability(struct lotspeed *ca,
+                                             const struct rate_sample *rs,
+                                             u32 rtt_us,
+                                             bool ecn_seen)
+{
+    u32 loss_rate_permille = 0;
+    u32 rtt_inflation = 0;
+    u32 instant_prob = 0;
+    u32 loss_boost = 0;
+    bool sample_loss = false;
+    bool rtt_stable = true;
+
+    if (!lotserver_zeta_ml || !ca)
+        return;
+
+    if (ca->packet_window_count > 0)
+        loss_rate_permille = SAFE_DIV(ca->loss_window_count * 1000, ca->packet_window_count);
+
+    if (ca->rtt_min > 0 && rtt_us > ca->rtt_min)
+        rtt_inflation = SAFE_DIV((rtt_us - ca->rtt_min) * 1000, ca->rtt_min);
+
+    rtt_stable = (rtt_inflation < 150 &&
+                  ca->rtt_variance < (ca->rtt_min >> 2) + RTT_JITTER_TOLERANCE_US);
+
+    if (rs && rs->losses > 0) {
+        sample_loss = true;
+        loss_boost = min_t(u32, rs->losses * 90U, 300U);
+        atomic_inc(&zeta_ml_loss_events);
+
+        if (rtt_stable) {
+            zeta_raise_prob(&ca->random_loss_probability, 100 + loss_boost / 2);
+            ca->burst_loss_probability = zeta_decay_prob(ca->burst_loss_probability);
+            ca->tail_loss_probability = zeta_decay_prob(ca->tail_loss_probability);
+        } else if (rtt_inflation >= 300) {
+            zeta_raise_prob(&ca->tail_loss_probability, 120 + loss_boost);
+            zeta_raise_prob(&ca->burst_loss_probability, 60 + loss_boost / 2);
+        } else {
+            zeta_raise_prob(&ca->burst_loss_probability, 120 + loss_boost);
+        }
+    }
+
+    if (ecn_seen) {
+        zeta_raise_prob(&ca->burst_loss_probability, 120);
+        zeta_raise_prob(&ca->tail_loss_probability, 80);
+    }
+
+    if (!sample_loss && !ecn_seen) {
+        ca->random_loss_probability = zeta_decay_prob(ca->random_loss_probability);
+        ca->burst_loss_probability = zeta_decay_prob(ca->burst_loss_probability);
+        ca->tail_loss_probability = zeta_decay_prob(ca->tail_loss_probability);
+    }
+
+    instant_prob = min_t(u32, loss_rate_permille * 16U, 600U);
+    instant_prob += min_t(u32, rtt_inflation / 2U, 350U);
+    instant_prob += ca->burst_loss_probability / 5;
+    instant_prob += ca->tail_loss_probability / 5;
+    instant_prob += ca->random_loss_probability / 8;
+    instant_prob = min_t(u32, instant_prob, ZETA_ML_PROB_SCALE);
+
+    ca->loss_probability = (u16)zeta_ewma_u32(ca->loss_probability, instant_prob, 8);
+    zeta_path_update(ca);
+}
+
+static void lotspeed_note_loss_event(struct lotspeed *ca, u32 rtt_us)
+{
+    if (!lotserver_zeta_ml || !ca)
+        return;
+
+    if (ca->rtt_min > 0 && rtt_us > ca->rtt_min + (ca->rtt_min >> 2)) {
+        zeta_raise_prob(&ca->burst_loss_probability, 180);
+        zeta_raise_prob(&ca->tail_loss_probability, 120);
+    } else {
+        zeta_raise_prob(&ca->random_loss_probability, 120);
+    }
+
+    zeta_raise_prob(&ca->loss_probability, 120);
+    atomic_inc(&zeta_ml_loss_events);
+    zeta_path_update(ca);
+}
+
 // --- 核心算法 ---
 static void lotspeed_adapt_and_control(struct sock *sk, const struct rate_sample *rs, int flag)
 {
@@ -431,6 +617,9 @@ static void lotspeed_adapt_and_control(struct sock *sk, const struct rate_sample
     u32 cwnd, target_cwnd;
     u32 mss = tp->mss_cache ? : 1460;
     bool congestion_detected = false;
+    bool ecn_seen = (flag & CA_ACK_ECE) != 0;
+    u32 local_cong_prob = 0;
+    u32 path_score = 0;
 
     lotspeed_update_rtt(sk, rtt_us);
     if (!rtt_us) rtt_us = 1000;
@@ -448,6 +637,10 @@ static void lotspeed_adapt_and_control(struct sock *sk, const struct rate_sample
             ca->loss_window_count >>= 1;
         }
     }
+
+    lotspeed_update_loss_probability(ca, rs, rtt_us, ecn_seen);
+    local_cong_prob = lotspeed_local_congestion_prob(ca);
+    path_score = zeta_path_score_read();
 
     // --- v5.6: 自适应攀升逻辑 (Auto-Scaling) ---
     if (bw > 0) {
@@ -474,13 +667,30 @@ static void lotspeed_adapt_and_control(struct sock *sk, const struct rate_sample
         if (ca->target_rate < lotserver_start_rate / 2)
             ca->target_rate = lotserver_start_rate / 2;
     }
+
+    if (lotserver_zeta_ml && lotserver_cross_flow &&
+        path_score >= lotserver_loss_prob_thresh &&
+        ca->target_rate > lotserver_start_rate) {
+        u32 backoff = (path_score >= 900) ? 95 : 98;
+        ca->target_rate = ca->target_rate * backoff / 100;
+        if (ca->target_rate < lotserver_start_rate / 2)
+            ca->target_rate = lotserver_start_rate / 2;
+        atomic_inc(&zeta_ml_cross_flow_events);
+    }
     // --------------------------------------
 
     if (!lotserver_turbo || lotserver_safe_mode) {
-        if (flag & CA_ACK_ECE) congestion_detected = true;
+        if (ecn_seen) congestion_detected = true;
         if (ca->rtt_min > 0 && ca->rtt_variance > 0) {
             u32 threshold = ca->rtt_min + (ca->rtt_min >> 2) + ca->rtt_variance;
             if (rtt_us > threshold) congestion_detected = true;
+        }
+        if (lotserver_zeta_ml) {
+            if (local_cong_prob >= lotserver_loss_prob_thresh)
+                congestion_detected = true;
+            if (path_score >= lotserver_loss_prob_thresh &&
+                ca->loss_probability >= lotserver_loss_prob_thresh / 2)
+                congestion_detected = true;
         }
     }
 
@@ -548,6 +758,15 @@ static void lotspeed_adapt_and_control(struct sock *sk, const struct rate_sample
         if (max_safe_cwnd < 16) max_safe_cwnd = 16;
         if (target_cwnd > max_safe_cwnd) target_cwnd = max_safe_cwnd;
     }
+    if (target_cwnd > 0 && lotserver_zeta_ml) {
+        u32 ml_score = max(local_cong_prob, path_score);
+        if (ml_score >= lotserver_loss_prob_thresh) {
+            u32 reduction = min_t(u32, 350U, ml_score / 3);
+            target_cwnd = target_cwnd * (ZETA_ML_PROB_SCALE - reduction) / ZETA_ML_PROB_SCALE;
+            if (target_cwnd < lotserver_min_cwnd)
+                target_cwnd = lotserver_min_cwnd;
+        }
+    }
     // ---------------------------
 
     if (ca->state == PROBE_RTT) {
@@ -601,6 +820,7 @@ static u32 lotspeed_ssthresh(struct sock *sk)
     struct lotspeed *ca = inet_csk_ca(sk);
     u32 rtt_us = tp->srtt_us >> 3;
     u32 tolerance, new_ssthresh;
+    u32 zeta_cong_prob = lotspeed_local_congestion_prob(ca);
     bool high_loss_detected = false;
 
     if (lotserver_turbo && !lotserver_safe_mode) return TCP_INFINITE_SSTHRESH;
@@ -615,12 +835,16 @@ static u32 lotspeed_ssthresh(struct sock *sk)
             high_loss_detected = true;
         }
     }
+    if (lotserver_zeta_ml && zeta_cong_prob >= lotserver_loss_prob_thresh)
+        high_loss_detected = true;
 
     tolerance = (base_rtt * LOSS_DIFFERENTIATION_K) / 100;
     tolerance += RTT_JITTER_TOLERANCE_US;
     if (ca->rtt_variance > 0) tolerance += ca->rtt_variance / 2;
 
-    if (rtt_us <= tolerance && !high_loss_detected) {
+    if (rtt_us <= tolerance && !high_loss_detected &&
+        (!lotserver_zeta_ml ||
+         ca->random_loss_probability >= max(ca->burst_loss_probability, ca->tail_loss_probability))) {
         // Loss Immunity
         ca->last_loss_rtt = rtt_us;
         if (lotserver_safe_mode) new_ssthresh = (tp->snd_cwnd * 95) / 100;
@@ -629,6 +853,7 @@ static u32 lotspeed_ssthresh(struct sock *sk)
         // Congestion
         ca->loss_count++;
         ca->last_loss_rtt = rtt_us;
+        lotspeed_note_loss_event(ca, rtt_us);
 
         if (high_loss_detected) {
             ca->cwnd_gain = 10;
@@ -644,16 +869,24 @@ static u32 lotspeed_ssthresh(struct sock *sk)
 
 static void lotspeed_set_state_hook(struct sock *sk, u8 new_state)
 {
+    struct tcp_sock *tp = tcp_sk(sk);
     struct lotspeed *ca = inet_csk_ca(sk);
+    u32 rtt_us = tp->srtt_us >> 3;
+
     switch (new_state) {
         case TCP_CA_Loss:
             if (!lotserver_turbo || lotserver_safe_mode) {
                 ca->loss_count++;
+                lotspeed_note_loss_event(ca, rtt_us ? rtt_us : ca->rtt_median);
                 enter_state(sk, AVOIDING);
             }
             break;
         case TCP_CA_Recovery:
-            if (!lotserver_turbo || lotserver_safe_mode) ca->cwnd_gain = max_t(u32, ca->cwnd_gain * 9 / 10, 15);
+            if (!lotserver_turbo || lotserver_safe_mode) {
+                ca->cwnd_gain = max_t(u32, ca->cwnd_gain * 9 / 10, 15);
+                if (lotserver_zeta_ml)
+                    zeta_raise_prob(&ca->burst_loss_probability, 80);
+            }
             break;
         case TCP_CA_Open:
             ca->ss_mode = false;
@@ -666,6 +899,9 @@ static u32 lotspeed_undo_cwnd(struct sock *sk)
     struct tcp_sock *tp = tcp_sk(sk);
     struct lotspeed *ca = inet_csk_ca(sk);
     if (ca->loss_count > 0) ca->loss_count--;
+    ca->loss_probability = zeta_decay_prob(ca->loss_probability);
+    ca->burst_loss_probability = zeta_decay_prob(ca->burst_loss_probability);
+    ca->tail_loss_probability = zeta_decay_prob(ca->tail_loss_probability);
     ca->ss_mode = false;
     return max(tp->snd_cwnd, tp->prior_cwnd);
 }
@@ -676,6 +912,7 @@ static void lotspeed_cwnd_event(struct sock *sk, enum tcp_ca_event event)
     switch (event) {
         case CA_EVENT_LOSS:
             ca->loss_count++;
+            lotspeed_note_loss_event(ca, ca->rtt_median);
             if (!lotserver_turbo || lotserver_safe_mode) ca->cwnd_gain = max_t(u32, ca->cwnd_gain - 5, 10);
             break;
         case CA_EVENT_TX_START:
@@ -704,10 +941,19 @@ static int __init lotspeed_module_init(void)
 {
     BUILD_BUG_ON(sizeof(struct lotspeed) > ICSK_CA_PRIV_SIZE);
 
-    pr_info("lotspeed v5.6 (Auto-Scaling) loaded.\n");
+    zeta_path_rtt_min = 0;
+    zeta_path_rtt_avg = 0;
+    zeta_path_loss_probability = 0;
+    zeta_path_congestion_score = 0;
+
+    pr_info("lotspeed v5.7 (Auto-Scaling + Zeta-ML) loaded.\n");
     pr_info("Struct size: %u bytes (limit: %u)\n",
             (unsigned int)sizeof(struct lotspeed),
             (unsigned int)ICSK_CA_PRIV_SIZE);
+    pr_info("Zeta-ML: %s, cross-flow: %s, loss-thresh=%u/1000\n",
+            lotserver_zeta_ml ? "on" : "off",
+            lotserver_cross_flow ? "on" : "off",
+            lotserver_loss_prob_thresh);
 
     hash_init(zeta_history_map);
     return tcp_register_congestion_control(&lotspeed_ops);
@@ -729,7 +975,7 @@ static void __exit lotspeed_module_exit(void)
         kfree(entry);
     }
     spin_unlock_bh(&zeta_history_lock);
-    pr_info("lotspeed v5.6 unloaded.\n");
+    pr_info("lotspeed v5.7 unloaded.\n");
 }
 
 module_init(lotspeed_module_init);
@@ -737,7 +983,7 @@ module_exit(lotspeed_module_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("uk0");
-MODULE_VERSION("5.6");
+MODULE_VERSION("5.7");
 MODULE_AUTHOR("NeoJ <super@qwq.chat>");
-MODULE_DESCRIPTION("LotSpeed Zeta - Auto-Scaling Edition");
+MODULE_DESCRIPTION("LotSpeed Zeta - Auto-Scaling + ML Edition");
 MODULE_ALIAS("tcp_lotspeed");
