@@ -1,5 +1,5 @@
 /*
- * lotspeed_zeta_v5_7.c
+ * lotspeed_zeta_v5_7_1.c
  * "公路超跑" Zeta-TCP (Auto-Scaling + ML Edition)
  * Author: uk0
  *
@@ -61,11 +61,15 @@
 #define ZETA_ML_PROB_SCALE 1000
 #define ZETA_ML_DECAY_NUM 7
 #define ZETA_ML_DECAY_DEN 8
+#define ZETA_PATH_DECAY_INTERVAL_MS 250
+#define ZETA_PATH_STALE_RESET_MS 3000
+#define ZETA_CROSS_BACKOFF_INTERVAL_MS 250
 
 // --- 保护阈值 (Smart Guard) ---
 #define LOSS_RATE_CAP_PERCENT 15     // 丢包率熔断阈值 (15%)
 #define BDP_CAP_SCALE 3              // BDP 上限倍数 (v5.4 fix: 3x BDP)
 #define PACKET_HISTORY_WIN 128       // 滑动窗口大小
+#define LOTSPEED_MIN_RATE_FLOOR 1048576UL  // 1MB/s，防止 pacing 被压到近似不可用
 
 // --- BBR/LotSpeed 参数 ---
 #define LOTSPEED_BETA_SCALE 1024
@@ -168,6 +172,7 @@ static u32 zeta_path_rtt_min;
 static u32 zeta_path_rtt_avg;
 static u32 zeta_path_loss_probability;
 static u32 zeta_path_congestion_score;
+static u32 zeta_path_last_update;
 
 // --- ZETA 学习引擎结构 ---
 struct zeta_history_entry {
@@ -223,7 +228,7 @@ struct lotspeed {
     u32 rtt_cnt;
     u32 loss_count;
 
-    u32 bw_stalled_rounds;
+    u32 last_cross_backoff_ts;
     u32 probe_cnt;
     u32 rtt_variance;
     u32 last_loss_rtt;
@@ -264,6 +269,49 @@ static inline void zeta_raise_prob(u16 *prob, u32 delta)
     *prob = (u16)min_t(u32, next, ZETA_ML_PROB_SCALE);
 }
 
+static unsigned long lotspeed_rate_floor(void)
+{
+    unsigned long soft_floor = lotserver_start_rate / 2;
+
+    if (soft_floor < LOTSPEED_MIN_RATE_FLOOR)
+        soft_floor = LOTSPEED_MIN_RATE_FLOOR;
+    if (lotserver_rate > 0 && soft_floor > lotserver_rate)
+        soft_floor = lotserver_rate;
+
+    return soft_floor;
+}
+
+static void zeta_path_decay_locked(u32 now)
+{
+    u32 elapsed_ms;
+    u32 steps;
+    u32 i;
+
+    if (!zeta_path_last_update) {
+        zeta_path_last_update = now;
+        return;
+    }
+
+    elapsed_ms = jiffies_to_msecs((unsigned long)(now - zeta_path_last_update));
+    if (elapsed_ms < ZETA_PATH_DECAY_INTERVAL_MS)
+        return;
+
+    if (elapsed_ms >= ZETA_PATH_STALE_RESET_MS) {
+        zeta_path_loss_probability = 0;
+        zeta_path_congestion_score = 0;
+        zeta_path_rtt_avg = 0;
+        zeta_path_last_update = now;
+        return;
+    }
+
+    steps = min_t(u32, elapsed_ms / ZETA_PATH_DECAY_INTERVAL_MS, 8U);
+    for (i = 0; i < steps; i++) {
+        zeta_path_loss_probability = (zeta_path_loss_probability * 7) / 8;
+        zeta_path_congestion_score = (zeta_path_congestion_score * 7) / 8;
+    }
+    zeta_path_last_update = now;
+}
+
 static u32 zeta_path_score_read(void)
 {
     u32 score;
@@ -273,6 +321,7 @@ static u32 zeta_path_score_read(void)
         return 0;
 
     spin_lock_irqsave(&zeta_path_lock, flags);
+    zeta_path_decay_locked(tcp_jiffies32);
     score = max(zeta_path_congestion_score, zeta_path_loss_probability);
     spin_unlock_irqrestore(&zeta_path_lock, flags);
 
@@ -291,6 +340,7 @@ static void zeta_path_update(struct lotspeed *ca)
     score = max_t(u32, score, ca->loss_probability);
 
     spin_lock_irqsave(&zeta_path_lock, flags);
+    zeta_path_decay_locked(tcp_jiffies32);
     if (ca->rtt_min &&
         (!zeta_path_rtt_min || ca->rtt_min < zeta_path_rtt_min))
         zeta_path_rtt_min = ca->rtt_min;
@@ -429,7 +479,7 @@ static void lotspeed_init(struct sock *sk)
 
     // --- v5.6: 软启动 (Soft Start) ---
     // 不再直接使用 lotserver_rate (1Gbps)，而是使用 start_rate (50Mbps)
-    ca->target_rate = lotserver_start_rate;
+    ca->target_rate = max_t(u64, lotserver_start_rate, lotspeed_rate_floor());
 
     ca->cwnd_gain = lotserver_gain;
     ca->ss_mode = true;
@@ -461,6 +511,9 @@ static void lotspeed_init(struct sock *sk)
             }
             if (ca->target_rate > lotserver_rate) {
                 ca->target_rate = lotserver_rate;
+            }
+            if (ca->target_rate < lotspeed_rate_floor()) {
+                ca->target_rate = lotspeed_rate_floor();
             }
 
             ca->rtt_min = history->cached_min_rtt;
@@ -620,6 +673,7 @@ static void lotspeed_adapt_and_control(struct sock *sk, const struct rate_sample
     bool ecn_seen = (flag & CA_ACK_ECE) != 0;
     u32 local_cong_prob = 0;
     u32 path_score = 0;
+    unsigned long rate_floor = lotspeed_rate_floor();
 
     lotspeed_update_rtt(sk, rtt_us);
     if (!rtt_us) rtt_us = 1000;
@@ -663,20 +717,25 @@ static void lotspeed_adapt_and_control(struct sock *sk, const struct rate_sample
             ca->target_rate = (ca->target_rate * 9 + bw) / 10;
         }
 
-        // 3. 兜底：不能低于 start_rate 的一半
-        if (ca->target_rate < lotserver_start_rate / 2)
-            ca->target_rate = lotserver_start_rate / 2;
+        // 3. 兜底：不能低于安全下限
+        if (ca->target_rate < rate_floor)
+            ca->target_rate = rate_floor;
     }
 
     if (lotserver_zeta_ml && lotserver_cross_flow &&
         path_score >= lotserver_loss_prob_thresh &&
-        ca->target_rate > lotserver_start_rate) {
+        ca->target_rate > max_t(unsigned long, lotserver_start_rate, rate_floor) &&
+        time_after32(tcp_jiffies32, ca->last_cross_backoff_ts +
+                     msecs_to_jiffies(ZETA_CROSS_BACKOFF_INTERVAL_MS))) {
         u32 backoff = (path_score >= 900) ? 95 : 98;
         ca->target_rate = ca->target_rate * backoff / 100;
-        if (ca->target_rate < lotserver_start_rate / 2)
-            ca->target_rate = lotserver_start_rate / 2;
+        if (ca->target_rate < rate_floor)
+            ca->target_rate = rate_floor;
+        ca->last_cross_backoff_ts = tcp_jiffies32;
         atomic_inc(&zeta_ml_cross_flow_events);
     }
+    if (ca->target_rate < rate_floor)
+        ca->target_rate = rate_floor;
     // --------------------------------------
 
     if (!lotserver_turbo || lotserver_safe_mode) {
@@ -945,8 +1004,9 @@ static int __init lotspeed_module_init(void)
     zeta_path_rtt_avg = 0;
     zeta_path_loss_probability = 0;
     zeta_path_congestion_score = 0;
+    zeta_path_last_update = 0;
 
-    pr_info("lotspeed v5.7 (Auto-Scaling + Zeta-ML) loaded.\n");
+    pr_info("lotspeed v5.7.1 (Auto-Scaling + Zeta-ML) loaded.\n");
     pr_info("Struct size: %u bytes (limit: %u)\n",
             (unsigned int)sizeof(struct lotspeed),
             (unsigned int)ICSK_CA_PRIV_SIZE);
@@ -975,7 +1035,7 @@ static void __exit lotspeed_module_exit(void)
         kfree(entry);
     }
     spin_unlock_bh(&zeta_history_lock);
-    pr_info("lotspeed v5.7 unloaded.\n");
+    pr_info("lotspeed v5.7.1 unloaded.\n");
 }
 
 module_init(lotspeed_module_init);
@@ -983,7 +1043,7 @@ module_exit(lotspeed_module_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("uk0");
-MODULE_VERSION("5.7");
+MODULE_VERSION("5.7.1");
 MODULE_AUTHOR("NeoJ <super@qwq.chat>");
 MODULE_DESCRIPTION("LotSpeed Zeta - Auto-Scaling + ML Edition");
 MODULE_ALIAS("tcp_lotspeed");

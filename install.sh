@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# LotSpeed v5.7 - Zeta-TCP Auto-Scaling + ML Edition (UI Enhanced)
+# LotSpeed v5.7.1 - Zeta-TCP Auto-Scaling + ML Edition (UI Enhanced)
 # Author: uk0 @ 2025-11-23
 # GitHub: https://github.com/Zephyr177/lotspeed
 #
@@ -15,7 +15,7 @@ GITHUB_REPO="Zephyr177/lotspeed"
 GITHUB_BRANCH="${LOTSPEED_BRANCH:-zeta-tcp}"
 INSTALL_DIR="/opt/lotspeed"
 MODULE_NAME="lotspeed"
-VERSION="5.7"
+VERSION="5.7.1"
 CURRENT_TIME=$(date '+%Y-%m-%d %H:%M:%S')
 CURRENT_USER=$(whoami)
 KERNEL_BUILD_DIR="/lib/modules/$(uname -r)/build"
@@ -150,7 +150,7 @@ print_banner() {
 ║                          |_|                                         ║
 ║                                                                      ║
 ║             Zeta-TCP Auto-Scaling + ML Edition                       ║
-║                       Version 5.7                                    ║
+║                       Version 5.7.1                                  ║
 ╚══════════════════════════════════════════════════════════════════════╝
 EOF
     echo -e "${NC}"
@@ -330,7 +330,7 @@ create_management_script() {
 
 ACTION=$1
 INSTALL_DIR="/opt/lotspeed"
-VERSION="5.7"
+VERSION="5.7.1"
 
 # 颜色
 RED='\033[0;31m'
